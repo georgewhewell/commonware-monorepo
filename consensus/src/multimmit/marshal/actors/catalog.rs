@@ -1958,9 +1958,9 @@ where
                 }
                 result?;
                 // The completed cut proved every full segment durable; retire them so their
-                // final checkpoints let later readers open them without replay. Retirement is
-                // an optimization with no ordering needs, so it never gates commit barriers;
-                // the store keeps retiring segments readable and unreclaimed until it completes.
+                // final checkpoints bound later recovery. Retirement is an optimization with no
+                // ordering needs, so it never gates commit barriers; the store keeps retiring
+                // segments readable and unreclaimed until it completes.
                 let retire_span = debug_span!(
                     parent: &span,
                     "multimmit.marshal.catalog.retire_pending",
@@ -3429,7 +3429,7 @@ mod tests {
         buffer::paged::CacheRef,
         deterministic::{self, Context as DeterministicContext},
         mocks::{
-            DelayedReadContext, DelayedSyncContext, PendingReads, PendingSyncs,
+            DelayedOpenContext, DelayedReadContext, DelayedSyncContext, PendingReads, PendingSyncs,
             drive_pending_syncs, release_next_pending_syncs,
         },
     };
@@ -4260,28 +4260,22 @@ mod tests {
             drop(client);
             assert!(handle.await.is_ok());
 
-            let syncs = PendingSyncs::default();
-            let delayed = DelayedSyncContext {
+            let opens = PendingReads::default();
+            let delayed = DelayedOpenContext {
                 inner: context.child("delayed"),
-                pending: syncs.clone(),
+                pending: opens.clone(),
             };
-            let (client, handle, _delivery) = drive_pending_syncs(
-                &syncs,
-                spawn_catalog(configure(), delayed.child("reopened")),
-            )
-            .await;
-            syncs.arm();
+            let (client, handle, _delivery) =
+                spawn_catalog(configure(), delayed.child("reopened")).await;
+            let gate = opens.arm();
             let mut admission = Box::pin(client.stage_block(next));
-            for _ in 0..100 {
-                if syncs.calls() > 0 {
-                    break;
-                }
-                select! {
-                    _ = &mut admission => panic!("append completed before opening its segment"),
-                    _ = context.sleep(std::time::Duration::from_millis(1)) => {},
-                }
+            select! {
+                _ = &mut admission => panic!("append completed before opening its segment"),
+                result = gate.blocked => result.unwrap(),
+                _ = context.sleep(std::time::Duration::from_millis(100)) => {
+                    panic!("new segment did not reach storage");
+                },
             }
-            assert!(syncs.calls() > 0, "new segment did not reach storage");
             let mut ordinary = Box::pin(client.block(first.reference()));
             select! {
                 _ = &mut ordinary => panic!("ordinary read overtook the admission"),
@@ -4336,7 +4330,7 @@ mod tests {
                 metric_total(&context.encode(), "materialized_bodies_total"),
                 u64::from(matches!(read_case, IndependentReadCase::Body))
             );
-            syncs.unblock();
+            gate.release.send(()).unwrap();
             admission.await.unwrap().wait().await.unwrap();
             assert_eq!(ordinary.await.unwrap().as_deref(), Some(first.as_ref()));
             drop(read);
@@ -4923,15 +4917,15 @@ mod tests {
             drop(client);
             assert!(handle.await.is_ok());
 
-            let reads = PendingReads::default();
-            let delayed = DelayedReadContext {
+            let opens = PendingReads::default();
+            let delayed = DelayedOpenContext {
                 inner: context.child("delayed"),
-                pending: reads.clone(),
+                pending: opens.clone(),
             };
             let (client, handle, _delivery) =
                 spawn_catalog(configure(&context), delayed.child("catalog")).await;
 
-            let gate = reads.arm();
+            let gate = opens.arm();
             let mut first = Box::pin(client.block(blocks[0].reference()));
             commonware_macros::select! {
                 result = &mut first => panic!("cold body read completed before reaching storage: {result:?}"),

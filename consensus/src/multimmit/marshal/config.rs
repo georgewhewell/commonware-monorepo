@@ -233,11 +233,11 @@ pub struct Config<T: Translator, V: Variant, B: Codec + Digestible> {
     /// Maximum items coalesced into one pending-custody admission durability cut.
     ///
     /// Must not exceed [`Self::pending_segment_items`] so one maximum admission wave crosses at
-    /// most one segment boundary and dirties at most two body and two compact-metadata journals.
+    /// most one segment boundary and dirties at most two pending-block segments.
     pub admission_cut_capacity: NonZeroUsize,
     /// Items in each pending-block storage segment.
     ///
-    /// A segment is the unit of pending-custody reclamation and of cold-reader recovery, so
+    /// A segment is the unit of pending-custody reclamation and startup recovery, so
     /// its byte bound is approximately `pending_segment_items * max_block_bytes` plus
     /// framing. This value is persisted storage geometry and must remain unchanged when
     /// reopening an existing storage namespace.
