@@ -19,6 +19,7 @@ use std::{
     future::Future,
     mem::take,
     num::NonZeroUsize,
+    ops::{Deref, DerefMut},
 };
 use tracing::debug;
 
@@ -86,25 +87,45 @@ impl<B: Blob> SectionBuffer for Writer<B> {
     }
 }
 
-impl<B: Blob> SectionBuffer for Write<B> {
+/// A buffered writer retaining a coordinated blob handle for owned readers.
+pub struct WriteBuffer<B: Blob> {
+    pub blob: B,
+    writer: Write<B>,
+}
+
+impl<B: Blob> Deref for WriteBuffer<B> {
+    type Target = Write<B>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl<B: Blob> DerefMut for WriteBuffer<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl<B: Blob> SectionBuffer for WriteBuffer<B> {
     fn size(&self) -> u64 {
-        Self::size(self)
+        self.writer.size()
     }
 
     async fn sync(&mut self) -> Result<(), RError> {
-        Self::sync(self).await
+        self.writer.sync().await
     }
 
     async fn start_sync(&mut self) -> Handle<()> {
-        Self::start_sync(self).await
+        self.writer.start_sync().await
     }
 
     async fn wait_for_sync(&mut self) -> Result<(), RError> {
-        Self::wait_for_sync(self).await
+        self.writer.wait_for_sync().await
     }
 
     async fn resize(&mut self, len: u64) -> Result<(), RError> {
-        Self::resize(self, len).await
+        self.writer.resize(len).await
     }
 }
 
@@ -154,10 +175,13 @@ pub struct WriteFactory {
 }
 
 impl<B: Blob> BufferFactory<B> for WriteFactory {
-    type Buffer = Write<B>;
+    type Buffer = WriteBuffer<B>;
 
     async fn create(&self, blob: B, size: u64) -> Result<Self::Buffer, RError> {
-        Ok(Write::new(blob, size, self.capacity, self.pool.clone()))
+        Ok(WriteBuffer {
+            writer: Write::new(blob.clone(), size, self.capacity, self.pool.clone()),
+            blob,
+        })
     }
 }
 
