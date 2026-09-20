@@ -2,7 +2,7 @@
 
 use super::{
     Context,
-    tracing::{Config, export},
+    tracing::{Config, layer},
 };
 use crate::{Metrics as _, Spawner, Supervisor as _};
 use axum::{
@@ -34,7 +34,9 @@ pub struct Logs {
 /// Initialize telemetry with the given configuration.
 ///
 /// If `metrics` is provided, starts serving metrics at the given address at `/metrics`.
-/// If `traces` is provided, enables OpenTelemetry trace export. When `None`, span
+/// With the `otel` feature, `traces` enables OpenTelemetry trace export. Without
+/// that feature the configuration is ignored and no exporter is compiled.
+/// When tracing is disabled, span
 /// callsites in the runtime-provided subscriber are disabled and only log events
 /// are emitted (per [`Logs::level`]).
 pub fn init(context: Context, logs: Logs, metrics: Option<SocketAddr>, traces: Option<Config>) {
@@ -50,24 +52,19 @@ pub fn init(context: Context, logs: Logs, metrics: Option<SocketAddr>, traces: O
     } else {
         log_layer.compact().boxed()
     };
-    let log_layer = match &traces {
-        None => log_layer
+    let log_layer = match cfg!(feature = "otel") && traces.is_some() {
+        false => log_layer
             .with_filter(filter_fn(move |metadata| {
                 metadata.is_event() && *metadata.level() <= logs.level
             }))
             .boxed(),
-        Some(_) => log_layer
+        true => log_layer
             .with_filter(tracing_subscriber::EnvFilter::new(logs.level.to_string()))
             .boxed(),
     };
 
     // Create OpenTelemetry layer for tracing
-    let trace_layer = traces.map(|cfg| {
-        let tracer = export(cfg).expect("Failed to initialize tracer");
-        tracing_opentelemetry::layer()
-            .with_tracer(tracer)
-            .with_filter(tracing_subscriber::EnvFilter::new(logs.level.to_string()))
-    });
+    let trace_layer = layer(traces, logs.level);
 
     // Create tracing registry.
     cfg_if! {

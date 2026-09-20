@@ -32,7 +32,7 @@ governor.workspace = true
 io-uring = { workspace = true, optional = true }
 libc.workspace = true
 loom = { workspace = true, optional = true }
-opentelemetry.workspace = true
+opentelemetry = { workspace = true, optional = true }
 pin-project = { workspace = true, optional = true }
 prometheus-client.workspace = true
 rand = { workspace = true, features = ["std_rng"] }
@@ -42,7 +42,7 @@ sha2.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-opentelemetry.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
@@ -61,8 +61,8 @@ axum.workspace = true
 console-subscriber = { workspace = true, features = ["parking_lot"], optional = true }
 criterion = { workspace = true, features = ["async"] }
 crossbeam-queue = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, features = ["http-proto"] }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { workspace = true, features = ["http-proto"], optional = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
@@ -72,6 +72,7 @@ serde_json.workspace = true
 
 [features]
 default = []
+otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-cryptography/arbitrary",
