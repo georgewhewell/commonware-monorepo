@@ -53,6 +53,14 @@ where
     })
 }
 
+fn missing_or_io(error: std::io::Error, missing: Error) -> Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        missing
+    } else {
+        error.into()
+    }
+}
+
 /// Configuration for filesystem storage on an existing Tokio runtime.
 #[derive(Clone)]
 pub struct Config {
@@ -162,20 +170,31 @@ impl Storage {
             .await
             .map_err(|error| Error::from(std::io::Error::from(error)))?
     }
-}
+    /// Open an existing blob without creating, repairing or writing its contents.
+    ///
+    /// Uses [`crate::DEFAULT_BLOB_VERSION`]. An incomplete container header is
+    /// corruption, not an interrupted create to repair. Returned handles reject
+    /// mutation. Concurrent writers may change bytes during inspection; this is
+    /// not a snapshot or a grant of exclusive ownership.
+    pub async fn open_read_only(
+        &self,
+        partition: &str,
+        name: &[u8],
+    ) -> Result<(<Self as crate::Storage>::Blob, u64), Error> {
+        let version = crate::DEFAULT_BLOB_VERSION;
+        let (blob, size, _) = self
+            .open_blob(partition, name, version..=version, false)
+            .await?;
+        Ok((blob, size))
+    }
 
-impl crate::Storage for Storage {
-    #[cfg(unix)]
-    type Blob = unix::Blob;
-    #[cfg(not(unix))]
-    type Blob = fallback::Blob;
-
-    async fn open_versioned(
+    async fn open_blob(
         &self,
         partition: &str,
         name: &[u8],
         versions: RangeInclusive<u16>,
-    ) -> Result<(Self::Blob, u64, u16), Error> {
+        writable: bool,
+    ) -> Result<(<Self as crate::Storage>::Blob, u64, u16), Error> {
         super::validate_partition_name(partition)?;
         let partition = partition.to_string();
         let name = name.to_vec();
@@ -198,21 +217,23 @@ impl crate::Storage for Storage {
             let parent_existed = parent.exists();
 
             // Create the partition directory, if it does not exist
-            fs::create_dir_all(parent)
-                .map_err(|_| Error::PartitionCreationFailed(partition.into()))?;
+            if writable {
+                fs::create_dir_all(parent)
+                    .map_err(|_| Error::PartitionCreationFailed(partition.into()))?;
+            }
 
             // Open the file, creating it if it doesn't exist
             let mut file = fs::OpenOptions::new()
                 .read(true)
-                .write(true)
-                .create(true)
+                .write(writable)
+                .create(writable)
                 .truncate(false)
                 .open(&path)
                 .map_err(|e| Error::BlobOpenFailed(partition.into(), hex(name), e.into()))?;
 
             // Assume empty files are newly created. Existing empty files will be synced too; that's OK.
             let len = file.metadata().map_err(|_| Error::ReadFailed)?.len();
-            let newly_created = len == 0;
+            let newly_created = writable && len == 0;
 
             // Only sync if we created a new file
             if newly_created {
@@ -237,6 +258,13 @@ impl crate::Storage for Storage {
             // Handle header: new/corrupted blobs get a fresh header written,
             // existing blobs have their header read.
             let (blob_version, logical_size) = if Header::missing(len) {
+                if !writable {
+                    return Err(Error::BlobCorrupt(
+                        partition.into(),
+                        hex(name),
+                        "incomplete blob header".into(),
+                    ));
+                }
                 // New or partially-created blob: reset it and write a fresh header. The
                 // file grows only as header bytes are written, so a create interrupted by
                 // a process crash leaves some prefix of the header, which the next open
@@ -262,7 +290,7 @@ impl crate::Storage for Storage {
             {
                 // Construct the blob
                 Ok((
-                    Self::Blob::new(
+                    <Self as crate::Storage>::Blob::new(
                         partition.into(),
                         name,
                         file,
@@ -278,13 +306,34 @@ impl crate::Storage for Storage {
                 let mut file = tokio::fs::File::from_std(file);
                 file.set_max_buf_size(storage.cfg.maximum_buffer_size);
                 Ok((
-                    Self::Blob::new(partition.into(), name, file, storage.pool.clone()),
+                    <Self as crate::Storage>::Blob::new(
+                        partition.into(),
+                        name,
+                        file,
+                        storage.pool.clone(),
+                    ),
                     logical_size,
                     blob_version,
                 ))
             }
         })
         .await
+    }
+}
+
+impl crate::Storage for Storage {
+    #[cfg(unix)]
+    type Blob = unix::Blob;
+    #[cfg(not(unix))]
+    type Blob = fallback::Blob;
+
+    async fn open_versioned(
+        &self,
+        partition: &str,
+        name: &[u8],
+        versions: RangeInclusive<u16>,
+    ) -> Result<(Self::Blob, u64, u16), Error> {
+        self.open_blob(partition, name, versions, true).await
     }
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
@@ -298,8 +347,9 @@ impl crate::Storage for Storage {
             let path = storage.cfg.storage_directory.join(partition);
             if let Some(name) = name {
                 let blob_path = path.join(hex(name));
-                fs::remove_file(blob_path)
-                    .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
+                fs::remove_file(blob_path).map_err(|error| {
+                    missing_or_io(error, Error::BlobMissing(partition.into(), hex(name)))
+                })?;
 
                 // Sync the partition directory to ensure the removal is durable.
                 // Windows doesn't have a notion of syncing a directory entry to ensure that it's
@@ -307,7 +357,9 @@ impl crate::Storage for Storage {
                 #[cfg(unix)]
                 sync_dir(&path)?;
             } else {
-                fs::remove_dir_all(&path).map_err(|_| Error::PartitionMissing(partition.into()))?;
+                fs::remove_dir_all(&path).map_err(|error| {
+                    missing_or_io(error, Error::PartitionMissing(partition.into()))
+                })?;
 
                 // Sync the storage directory to ensure the removal is durable.
                 // Windows doesn't have a notion of syncing a directory entry to ensure that it's
@@ -327,8 +379,8 @@ impl crate::Storage for Storage {
             let partition = partition.as_str();
             // Scan the partition directory
             let path = storage.cfg.storage_directory.join(partition);
-            let entries =
-                fs::read_dir(path).map_err(|_| Error::PartitionMissing(partition.into()))?;
+            let entries = fs::read_dir(path)
+                .map_err(|error| missing_or_io(error, Error::PartitionMissing(partition.into())))?;
             let mut blobs = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|_| Error::ReadFailed)?;
