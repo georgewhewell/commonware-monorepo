@@ -1,5 +1,5 @@
 use super::Header;
-use crate::{BufferPool, Error};
+use crate::{BufferPool, Error, telemetry::metrics::Registry};
 use commonware_codec::Encode;
 use commonware_formatting::{from_hex, hex};
 #[cfg(unix)]
@@ -37,13 +37,17 @@ async fn sync_dir(path: &Path) -> Result<(), Error> {
     })
 }
 
+/// Configuration for filesystem storage on an existing Tokio runtime.
 #[derive(Clone)]
 pub struct Config {
+    /// Root directory containing storage partitions.
     pub storage_directory: PathBuf,
+    /// Maximum buffer size used by Tokio file operations.
     pub maximum_buffer_size: usize,
 }
 
 impl Config {
+    /// Configure the storage root and maximum file-operation buffer size.
     pub const fn new(storage_directory: PathBuf, maximum_buffer_size: usize) -> Self {
         Self {
             storage_directory,
@@ -52,6 +56,14 @@ impl Config {
     }
 }
 
+/// Filesystem storage driven by the caller's Tokio runtime.
+///
+/// Initialize with [`Self::init`] before opening blobs. Clones share filesystem
+/// operation serialization and the buffer pool, but confer no exclusive writer
+/// ownership over a partition or blob. The caller must provide that ownership.
+/// This handle does not own a runtime. Keep the caller's runtime and writer
+/// ownership alive until outstanding blob operations complete, including when
+/// their waiting task is cancelled.
 #[derive(Clone)]
 pub struct Storage {
     lock: Arc<Mutex<()>>,
@@ -60,7 +72,47 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(cfg: Config, pool: BufferPool) -> Self {
+    /// Create the root and make recovered bytes crash-durable before returning.
+    ///
+    /// Returns an error without a running Tokio runtime. Preparation runs on its
+    /// blocking pool, without starting a second executor. If initialization is
+    /// cancelled, preparation may finish, but no storage handle is published.
+    ///
+    /// Linux uses `syncfs(2)` on the root's filesystem (kernel >= 5.8 is required
+    /// for reliable error reporting). The root must reside on one filesystem.
+    /// Other platforms return [`std::io::ErrorKind::Unsupported`]: their current
+    /// startup flush does not establish the [`crate::Storage`] durability contract.
+    ///
+    /// The buffer pool uses [`crate::BufferPoolConfig::for_storage`]; its metrics are
+    /// registered with `registry` and shared by all clones of this storage.
+    pub async fn init(cfg: Config, registry: &mut Registry) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let directory = cfg.storage_directory.clone();
+            let runtime = tokio::runtime::Handle::try_current().map_err(std::io::Error::other)?;
+            runtime
+                .spawn_blocking(move || {
+                    std::fs::create_dir_all(&directory)?;
+                    super::sync(&directory)
+                })
+                .await
+                .map_err(std::io::Error::other)??;
+            Ok(Self::new(
+                cfg,
+                BufferPool::new(crate::BufferPoolConfig::for_storage(), registry),
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (cfg, registry);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable storage initialization is not supported on this platform",
+            ))
+        }
+    }
+
+    pub(crate) fn new(cfg: Config, pool: BufferPool) -> Self {
         Self {
             lock: Arc::new(Mutex::new(())),
             cfg,
@@ -283,6 +335,11 @@ mod tests {
         let storage_directory =
             env::temp_dir().join(format!("storage_tokio_{}", rng.random::<u64>()));
         let config = Config::new(storage_directory, 2 * 1024 * 1024);
+        #[cfg(target_os = "linux")]
+        let storage = Storage::init(config, &mut Registry::default())
+            .await
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
         let storage = Storage::new(config, test_pool());
         run_storage_tests(storage).await;
     }

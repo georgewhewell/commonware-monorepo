@@ -23,6 +23,7 @@
 //! ```
 
 mod runtime;
+pub use crate::storage::tokio::{Config as StorageConfig, Storage};
 pub use runtime::*;
 pub mod telemetry;
 pub mod tracing;

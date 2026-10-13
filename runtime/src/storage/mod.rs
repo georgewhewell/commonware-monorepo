@@ -99,7 +99,7 @@ stability_scope!(ALPHA {
 stability_scope!(ALPHA, cfg(feature = "iouring-storage") {
     pub mod iouring;
 });
-stability_scope!(BETA, cfg(all(not(target_arch = "wasm32"), not(feature = "iouring-storage"))) {
+stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
     pub mod tokio;
 });
 stability_scope!(BETA {
