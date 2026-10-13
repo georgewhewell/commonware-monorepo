@@ -1,4 +1,4 @@
-use super::Header;
+use super::{Header, spawn_with_guard};
 use crate::{Buf, BufferPool, Error, Handle, IoBufs, IoBufsMut};
 use cfg_if::cfg_if;
 use commonware_formatting::hex;
@@ -9,7 +9,6 @@ use std::{
     os::{fd::AsRawFd, unix::fs::FileExt},
     sync::Arc,
 };
-use tokio::task;
 
 // Cap iovec batch size: larger iovecs reduce syscall count but increase
 // per-write kernel setup overhead.
@@ -21,15 +20,23 @@ pub struct Blob {
     name: Vec<u8>,
     file: Arc<File>,
     pool: BufferPool,
+    guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Blob {
-    pub fn new(partition: String, name: &[u8], file: File, pool: BufferPool) -> Self {
+    pub(super) fn new(
+        partition: String,
+        name: &[u8],
+        file: File,
+        pool: BufferPool,
+        guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             partition,
             name: name.into(),
             file: Arc::new(file),
             pool,
+            guard,
         }
     }
 
@@ -127,7 +134,7 @@ impl crate::Blob for Blob {
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        task::spawn_blocking(move || {
+        spawn_with_guard(self.guard.clone(), move || {
             if let Some(buf) = bufs.as_single_mut() {
                 // Read directly into the single buffer (zero-copy).
                 file.read_exact_at(buf.as_mut(), offset)?;
@@ -150,7 +157,7 @@ impl crate::Blob for Blob {
         let offset = offset
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        task::spawn_blocking(move || match bufs.try_into_single() {
+        spawn_with_guard(self.guard.clone(), move || match bufs.try_into_single() {
             Ok(buf) => Self::write_single_at(&file, offset, buf.as_ref()),
             Err(bufs) => Self::write_vectored_at(&file, offset, bufs, None),
         })
@@ -175,7 +182,7 @@ impl crate::Blob for Blob {
 
         cfg_if! {
             if #[cfg(target_os = "linux")] {
-                task::spawn_blocking(move || {
+                spawn_with_guard(self.guard.clone(), move || {
                     Self::write_vectored_at(&file, offset, bufs, Some(libc::RWF_SYNC))
                 })
                 .await
@@ -183,7 +190,7 @@ impl crate::Blob for Blob {
             } else {
                 let partition = self.partition.clone();
                 let name = self.name.clone();
-                task::spawn_blocking(move || {
+                spawn_with_guard(self.guard.clone(), move || {
                     Self::write_vectored_at(&file, offset, bufs, None)?;
                     Self::sync_inner(&file, &partition, &name)
                 })
@@ -198,7 +205,7 @@ impl crate::Blob for Blob {
         let len = len
             .checked_add(Header::SIZE_U64)
             .ok_or(Error::OffsetOverflow)?;
-        task::spawn_blocking(move || file.set_len(len))
+        spawn_with_guard(self.guard.clone(), move || file.set_len(len))
             .await
             .map_err(|e| e.into())
             .and_then(|r| r)
@@ -212,12 +219,14 @@ impl crate::Blob for Blob {
         let file = self.file.clone();
         let partition = self.partition.clone();
         let name = self.name.clone();
-        task::spawn_blocking(move || Self::sync_inner(&file, &partition, &name))
-            .await
-            .map_err(|e| {
-                let err: std::io::Error = e.into();
-                Error::BlobSyncFailed(self.partition.clone(), hex(&self.name), err.into())
-            })?
+        spawn_with_guard(self.guard.clone(), move || {
+            Self::sync_inner(&file, &partition, &name)
+        })
+        .await
+        .map_err(|e| {
+            let err: std::io::Error = e.into();
+            Error::BlobSyncFailed(self.partition.clone(), hex(&self.name), err.into())
+        })?
     }
 
     async fn start_sync(&self) -> Handle<()> {
@@ -225,10 +234,13 @@ impl crate::Blob for Blob {
         let file = self.file.clone();
         let partition = self.partition.clone();
         let name = self.name.clone();
-        task::spawn_blocking(move || {
+        spawn_with_guard(self.guard.clone(), move || {
             let result = Self::sync_inner(&file, &partition, &name);
             let _ = tx.send(result);
         });
         Handle::from_receiver(rx)
     }
 }
+
+#[cfg(test)]
+mod tests;

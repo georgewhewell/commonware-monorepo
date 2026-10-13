@@ -4,12 +4,14 @@ use commonware_codec::Encode;
 use commonware_formatting::{from_hex, hex};
 #[cfg(unix)]
 use std::path::Path;
-use std::{ops::RangeInclusive, path::PathBuf, sync::Arc};
-use tokio::{
+use std::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
+    io::{Read as _, Write as _},
+    ops::RangeInclusive,
+    path::PathBuf,
+    sync::Arc,
 };
+use tokio::{sync::Mutex, task::JoinHandle};
 
 #[cfg(not(unix))]
 mod fallback;
@@ -20,15 +22,15 @@ mod unix;
 /// On Unix, directory metadata (file creation/deletion) must be explicitly
 /// fsynced.
 #[cfg(unix)]
-async fn sync_dir(path: &Path) -> Result<(), Error> {
-    let dir = fs::File::open(path).await.map_err(|e| {
+fn sync_dir(path: &Path) -> Result<(), Error> {
+    let dir = fs::File::open(path).map_err(|e| {
         Error::BlobOpenFailed(
             path.to_string_lossy().to_string(),
             "directory".to_string(),
             e.into(),
         )
     })?;
-    dir.sync_all().await.map_err(|e| {
+    dir.sync_all().map_err(|e| {
         Error::BlobSyncFailed(
             path.to_string_lossy().to_string(),
             "directory".to_string(),
@@ -37,12 +39,26 @@ async fn sync_dir(path: &Path) -> Result<(), Error> {
     })
 }
 
+// The closure, including its guard, belongs to the blocking job. Cancelling a
+// waiter or shutting down its runtime cannot release ownership around running I/O.
+fn spawn_with_guard<G, T>(guard: G, operation: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T>
+where
+    G: Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let result = operation();
+        drop(guard);
+        result
+    })
+}
+
 /// Configuration for filesystem storage on an existing Tokio runtime.
 #[derive(Clone)]
 pub struct Config {
     /// Root directory containing storage partitions.
     pub storage_directory: PathBuf,
-    /// Maximum buffer size used by Tokio file operations.
+    /// Maximum buffer size for file operations on non-Unix platforms.
     pub maximum_buffer_size: usize,
 }
 
@@ -69,6 +85,8 @@ pub struct Storage {
     lock: Arc<Mutex<()>>,
     cfg: Config,
     pool: BufferPool,
+    #[cfg(unix)]
+    guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Storage {
@@ -117,7 +135,32 @@ impl Storage {
             lock: Arc::new(Mutex::new(())),
             cfg,
             pool,
+            #[cfg(unix)]
+            guard: None,
         }
+    }
+
+    /// Retain a caller-owned guard in this handle, its blobs and their native I/O.
+    ///
+    /// For example, pass an already-acquired journal lock. In-flight I/O keeps
+    /// the guard even if its waiter is cancelled or the runtime shuts down.
+    /// This does not acquire ownership itself or affect existing clones or blobs;
+    /// attach the guard before opening the guarded journal's blobs.
+    #[cfg(unix)]
+    pub fn with_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let lock = self.lock.clone().lock_owned().await;
+        let storage = self.clone();
+        spawn_with_guard(lock, move || operation(&storage))
+            .await
+            .map_err(|error| Error::from(std::io::Error::from(error)))?
     }
 }
 
@@ -134,177 +177,181 @@ impl crate::Storage for Storage {
         versions: RangeInclusive<u16>,
     ) -> Result<(Self::Blob, u64, u16), Error> {
         super::validate_partition_name(partition)?;
+        let partition = partition.to_string();
+        let name = name.to_vec();
+        self.run(move |storage| {
+            let partition = partition.as_str();
+            let name = name.as_slice();
+            // Construct the full path
+            let path = storage
+                .cfg
+                .storage_directory
+                .join(partition)
+                .join(hex(name));
+            let parent = match path.parent() {
+                Some(parent) => parent,
+                None => return Err(Error::PartitionCreationFailed(partition.into())),
+            };
 
-        // Acquire the filesystem lock
-        let _guard = self.lock.lock().await;
-
-        // Construct the full path
-        let path = self.cfg.storage_directory.join(partition).join(hex(name));
-        let parent = match path.parent() {
-            Some(parent) => parent,
-            None => return Err(Error::PartitionCreationFailed(partition.into())),
-        };
-
-        // Check if partition exists before creating
-        #[cfg(unix)]
-        let parent_existed = parent.exists();
-
-        // Create the partition directory, if it does not exist
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|_| Error::PartitionCreationFailed(partition.into()))?;
-
-        // Open the file, creating it if it doesn't exist
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .await
-            .map_err(|e| Error::BlobOpenFailed(partition.into(), hex(name), e.into()))?;
-
-        // Assume empty files are newly created. Existing empty files will be synced too; that's OK.
-        let len = file.metadata().await.map_err(|_| Error::ReadFailed)?.len();
-        let newly_created = len == 0;
-
-        // Only sync if we created a new file
-        if newly_created {
-            // Sync the file to ensure it is durable
-            file.sync_all()
-                .await
-                .map_err(|e| Error::BlobSyncFailed(partition.into(), hex(name), e.into()))?;
-
-            // Windows doesn't have a notion of syncing a directory entry to ensure that it's
-            // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
+            // Check if partition exists before creating
             #[cfg(unix)]
-            {
-                // Sync the parent directory to ensure the directory entry is durable.
-                sync_dir(parent).await?;
+            let parent_existed = parent.exists();
 
-                // Sync storage directory if parent directory did not exist
-                if !parent_existed {
-                    sync_dir(&self.cfg.storage_directory).await?;
+            // Create the partition directory, if it does not exist
+            fs::create_dir_all(parent)
+                .map_err(|_| Error::PartitionCreationFailed(partition.into()))?;
+
+            // Open the file, creating it if it doesn't exist
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| Error::BlobOpenFailed(partition.into(), hex(name), e.into()))?;
+
+            // Assume empty files are newly created. Existing empty files will be synced too; that's OK.
+            let len = file.metadata().map_err(|_| Error::ReadFailed)?.len();
+            let newly_created = len == 0;
+
+            // Only sync if we created a new file
+            if newly_created {
+                // Sync the file to ensure it is durable
+                file.sync_all()
+                    .map_err(|e| Error::BlobSyncFailed(partition.into(), hex(name), e.into()))?;
+
+                // Windows doesn't have a notion of syncing a directory entry to ensure that it's
+                // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
+                #[cfg(unix)]
+                {
+                    // Sync the parent directory to ensure the directory entry is durable.
+                    sync_dir(parent)?;
+
+                    // Sync storage directory if parent directory did not exist
+                    if !parent_existed {
+                        sync_dir(&storage.cfg.storage_directory)?;
+                    }
                 }
             }
-        }
 
-        // Set the maximum buffer size
-        file.set_max_buf_size(self.cfg.maximum_buffer_size);
+            // Handle header: new/corrupted blobs get a fresh header written,
+            // existing blobs have their header read.
+            let (blob_version, logical_size) = if Header::missing(len) {
+                // New or partially-created blob: reset it and write a fresh header. The
+                // file grows only as header bytes are written, so a create interrupted by
+                // a process crash leaves some prefix of the header, which the next open
+                // resets here instead of rejecting as corrupt below.
+                let (header, blob_version) = Header::new(&versions);
+                file.set_len(0)
+                    .map_err(|e| Error::BlobResizeFailed(partition.into(), hex(name), e.into()))?;
+                file.write_all(&header.encode())
+                    .map_err(|_| Error::WriteFailed)?;
+                file.sync_all()
+                    .map_err(|e| Error::BlobSyncFailed(partition.into(), hex(name), e.into()))?;
+                (blob_version, 0)
+            } else {
+                // Existing blob - read and validate header
+                let mut header_bytes = [0u8; Header::SIZE];
+                file.read_exact(&mut header_bytes)
+                    .map_err(|_| Error::ReadFailed)?;
+                Header::from(header_bytes, len, &versions)
+                    .map_err(|e| e.into_error(partition, name))?
+            };
 
-        // Handle header: new/corrupted blobs get a fresh header written,
-        // existing blobs have their header read.
-        let (blob_version, logical_size) = if Header::missing(len) {
-            // New or partially-created blob: reset it and write a fresh header. The
-            // file grows only as header bytes are written, so a create interrupted by
-            // a process crash leaves some prefix of the header, which the next open
-            // resets here instead of rejecting as corrupt below.
-            let (header, blob_version) = Header::new(&versions);
-            file.set_len(0)
-                .await
-                .map_err(|e| Error::BlobResizeFailed(partition.into(), hex(name), e.into()))?;
-            file.write_all(&header.encode())
-                .await
-                .map_err(|_| Error::WriteFailed)?;
-            file.sync_all()
-                .await
-                .map_err(|e| Error::BlobSyncFailed(partition.into(), hex(name), e.into()))?;
-            (blob_version, 0)
-        } else {
-            // Existing blob - read and validate header
-            let mut header_bytes = [0u8; Header::SIZE];
-            file.read_exact(&mut header_bytes)
-                .await
-                .map_err(|_| Error::ReadFailed)?;
-            Header::from(header_bytes, len, &versions).map_err(|e| e.into_error(partition, name))?
-        };
-
-        #[cfg(unix)]
-        {
-            // Convert to a blocking std::fs::File
-            let file = file.into_std().await;
-
-            // Construct the blob
-            Ok((
-                Self::Blob::new(partition.into(), name, file, self.pool.clone()),
-                logical_size,
-                blob_version,
-            ))
-        }
-        #[cfg(not(unix))]
-        {
-            // Construct the blob
-            Ok((
-                Self::Blob::new(partition.into(), name, file, self.pool.clone()),
-                logical_size,
-                blob_version,
-            ))
-        }
+            #[cfg(unix)]
+            {
+                // Construct the blob
+                Ok((
+                    Self::Blob::new(
+                        partition.into(),
+                        name,
+                        file,
+                        storage.pool.clone(),
+                        storage.guard.clone(),
+                    ),
+                    logical_size,
+                    blob_version,
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                let mut file = tokio::fs::File::from_std(file);
+                file.set_max_buf_size(storage.cfg.maximum_buffer_size);
+                Ok((
+                    Self::Blob::new(partition.into(), name, file, storage.pool.clone()),
+                    logical_size,
+                    blob_version,
+                ))
+            }
+        })
+        .await
     }
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         super::validate_partition_name(partition)?;
+        let partition = partition.to_string();
+        let name = name.map(<[u8]>::to_vec);
+        self.run(move |storage| {
+            let partition = partition.as_str();
+            let name = name.as_deref();
+            // Remove all related files
+            let path = storage.cfg.storage_directory.join(partition);
+            if let Some(name) = name {
+                let blob_path = path.join(hex(name));
+                fs::remove_file(blob_path)
+                    .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
 
-        // Acquire the filesystem lock
-        let _guard = self.lock.lock().await;
+                // Sync the partition directory to ensure the removal is durable.
+                // Windows doesn't have a notion of syncing a directory entry to ensure that it's
+                // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
+                #[cfg(unix)]
+                sync_dir(&path)?;
+            } else {
+                fs::remove_dir_all(&path).map_err(|_| Error::PartitionMissing(partition.into()))?;
 
-        // Remove all related files
-        let path = self.cfg.storage_directory.join(partition);
-        if let Some(name) = name {
-            let blob_path = path.join(hex(name));
-            fs::remove_file(blob_path)
-                .await
-                .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
-
-            // Sync the partition directory to ensure the removal is durable.
-            // Windows doesn't have a notion of syncing a directory entry to ensure that it's
-            // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
-            #[cfg(unix)]
-            sync_dir(&path).await?;
-        } else {
-            fs::remove_dir_all(&path)
-                .await
-                .map_err(|_| Error::PartitionMissing(partition.into()))?;
-
-            // Sync the storage directory to ensure the removal is durable.
-            // Windows doesn't have a notion of syncing a directory entry to ensure that it's
-            // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
-            #[cfg(unix)]
-            sync_dir(&self.cfg.storage_directory).await?;
-        }
-        Ok(())
+                // Sync the storage directory to ensure the removal is durable.
+                // Windows doesn't have a notion of syncing a directory entry to ensure that it's
+                // durably persisted. See https://github.com/commonwarexyz/monorepo/issues/2026.
+                #[cfg(unix)]
+                sync_dir(&storage.cfg.storage_directory)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
-
-        // Acquire the filesystem lock
-        let _guard = self.lock.lock().await;
-
-        // Scan the partition directory
-        let path = self.cfg.storage_directory.join(partition);
-        let mut entries = fs::read_dir(path)
-            .await
-            .map_err(|_| Error::PartitionMissing(partition.into()))?;
-        let mut blobs = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(|_| Error::ReadFailed)? {
-            let file_type = entry.file_type().await.map_err(|_| Error::ReadFailed)?;
-            if !file_type.is_file() {
-                return Err(Error::PartitionCorrupt(partition.into()));
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                // Reject anything that isn't canonical lowercase hex (no `0x`
-                // prefix, no whitespace) since `from_hex` is lenient and
-                // storage only ever writes the canonical form via `hex()`.
-                let decoded = from_hex(name).ok_or(Error::PartitionCorrupt(partition.into()))?;
-                if hex(&decoded) != name {
+        let partition = partition.to_string();
+        self.run(move |storage| {
+            let partition = partition.as_str();
+            // Scan the partition directory
+            let path = storage.cfg.storage_directory.join(partition);
+            let entries =
+                fs::read_dir(path).map_err(|_| Error::PartitionMissing(partition.into()))?;
+            let mut blobs = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|_| Error::ReadFailed)?;
+                let file_type = entry.file_type().map_err(|_| Error::ReadFailed)?;
+                if !file_type.is_file() {
                     return Err(Error::PartitionCorrupt(partition.into()));
                 }
+                if let Some(name) = entry.file_name().to_str() {
+                    // Reject anything that isn't canonical lowercase hex (no `0x`
+                    // prefix, no whitespace) since `from_hex` is lenient and
+                    // storage only ever writes the canonical form via `hex()`.
+                    let decoded =
+                        from_hex(name).ok_or(Error::PartitionCorrupt(partition.into()))?;
+                    if hex(&decoded) != name {
+                        return Err(Error::PartitionCorrupt(partition.into()));
+                    }
 
-                blobs.push(decoded);
+                    blobs.push(decoded);
+                }
             }
-        }
-        Ok(blobs)
+            Ok(blobs)
+        })
+        .await
     }
 }
 
