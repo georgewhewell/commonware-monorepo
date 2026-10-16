@@ -21,7 +21,7 @@ commonware-deployer.workspace = true
 commonware-formatting.workspace = true
 commonware-math.workspace = true
 commonware-p2p.workspace = true
-commonware-runtime.workspace = true
+commonware-runtime = { workspace = true, features = ["telemetry"] }
 commonware-utils.workspace = true
 futures.workspace = true
 rand = { workspace = true, features = ["alloc"] }

@@ -24,5 +24,7 @@
 
 mod runtime;
 pub use runtime::*;
+#[cfg(feature = "telemetry")]
 pub mod telemetry;
+#[cfg(feature = "telemetry")]
 pub mod tracing;
