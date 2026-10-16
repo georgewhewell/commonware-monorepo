@@ -1,5 +1,6 @@
 //! Utility functions for traces
 
+#[cfg(feature = "telemetry")]
 pub mod status;
 
 #[cfg(any(test, feature = "test-utils"))]

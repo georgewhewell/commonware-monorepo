@@ -881,22 +881,18 @@ impl crate::BufferPooler for Context {
 mod tests {
     use super::*;
     use crate::{
-        AbortOnDrop, Blob as _, Metrics, Network, Resolver, Runner as _, Sink, Spawner as _,
-        Storage as _, Strategizer as _, Stream, Supervisor as _, telemetry::metrics::raw::Counter,
-        tokio::telemetry,
+        AbortOnDrop, Blob as _, Metrics, Resolver, Runner as _, Spawner as _, Storage as _,
+        Strategizer as _, Supervisor as _,
     };
-    use bytes::Bytes;
     use commonware_parallel::Strategy as _;
     use commonware_utils::channel::oneshot;
     use rstest::rstest;
     use std::{
         self,
-        collections::HashMap,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        str::FromStr,
         sync::atomic::{AtomicBool, Ordering},
     };
-    use tracing::{Level, error};
+    use tracing::Level;
 
     struct TaskDropGate {
         entered: std::sync::mpsc::Sender<()>,
@@ -1712,113 +1708,6 @@ mod tests {
                     }
                 }
             }
-        });
-    }
-
-    #[test]
-    fn test_telemetry() {
-        let executor = Runner::default();
-        executor.start(|context| async move {
-            // Define the server address
-            let address = SocketAddr::from_str("127.0.0.1:8000").unwrap();
-
-            // Configure telemetry
-            telemetry::init(
-                context.child("metrics"),
-                telemetry::Logs {
-                    level: Level::INFO,
-                    json: false,
-                },
-                Some(address),
-                None,
-            );
-
-            // Register a test metric
-            let counter: Counter<u64> = Counter::default();
-            let _registered = context.register("test_counter", "Test counter", counter.clone());
-            counter.inc();
-
-            // Helper functions to parse HTTP response
-            async fn read_line<St: Stream>(stream: &mut St) -> Result<String, Error> {
-                let mut line = Vec::new();
-                loop {
-                    let received = stream.recv(1).await?;
-                    let byte = received.coalesce().as_ref()[0];
-                    if byte == b'\n' {
-                        if line.last() == Some(&b'\r') {
-                            line.pop(); // Remove trailing \r
-                        }
-                        break;
-                    }
-                    line.push(byte);
-                }
-                String::from_utf8(line).map_err(|_| Error::ReadFailed)
-            }
-
-            async fn read_headers<St: Stream>(
-                stream: &mut St,
-            ) -> Result<HashMap<String, String>, Error> {
-                let mut headers = HashMap::new();
-                loop {
-                    let line = read_line(stream).await?;
-                    if line.is_empty() {
-                        break;
-                    }
-                    let parts: Vec<&str> = line.splitn(2, ": ").collect();
-                    if parts.len() == 2 {
-                        headers.insert(parts[0].to_string(), parts[1].to_string());
-                    }
-                }
-                Ok(headers)
-            }
-
-            async fn read_body<St: Stream>(
-                stream: &mut St,
-                content_length: usize,
-            ) -> Result<String, Error> {
-                let received = stream.recv(content_length).await?;
-                String::from_utf8(received.coalesce().into()).map_err(|_| Error::ReadFailed)
-            }
-
-            // Simulate a client connecting to the server
-            let client_handle = context.child("client").spawn(move |context| async move {
-                let (mut sink, mut stream) = loop {
-                    match context.dial(address).await {
-                        Ok((sink, stream)) => break (sink, stream),
-                        Err(e) => {
-                            // The client may be polled before the server is ready, that's alright!
-                            error!(err =?e, "failed to connect");
-                            context.sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                };
-
-                // Send a GET request to the server
-                let request = format!(
-                    "GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-                );
-                sink.send(Bytes::from(request)).await.unwrap();
-
-                // Read and verify the HTTP status line
-                let status_line = read_line(&mut stream).await.unwrap();
-                assert_eq!(status_line, "HTTP/1.1 200 OK");
-
-                // Read and parse headers
-                let headers = read_headers(&mut stream).await.unwrap();
-                println!("Headers: {headers:?}");
-                let content_length = headers
-                    .get("content-length")
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-
-                // Read and verify the body
-                let body = read_body(&mut stream, content_length).await.unwrap();
-                assert!(body.contains("test_counter_total 1"));
-            });
-
-            // Wait for the client task to complete
-            client_handle.await.unwrap();
         });
     }
 

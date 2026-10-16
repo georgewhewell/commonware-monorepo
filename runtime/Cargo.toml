@@ -31,7 +31,7 @@ futures.workspace = true
 governor.workspace = true
 libc.workspace = true
 loom = { workspace = true, optional = true }
-opentelemetry.workspace = true
+opentelemetry = { workspace = true, optional = true }
 pin-project = { workspace = true, optional = true }
 prometheus-client.workspace = true
 rand = { workspace = true, features = ["std_rng"] }
@@ -41,7 +41,7 @@ sha2.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-opentelemetry.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -60,12 +60,12 @@ version = "0.2"
 features = ["js"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum.workspace = true
+axum = { workspace = true, optional = true }
 console-subscriber = { workspace = true, features = ["parking_lot"], optional = true }
 criterion = { workspace = true, features = ["async"] }
 crossbeam-queue = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, features = ["http-proto"] }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { workspace = true, features = ["http-proto"], optional = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
@@ -87,7 +87,14 @@ external = [ "pin-project" ]
 loom = [ "dep:loom" ]
 test-utils = []
 iouring = [ "dep:io-uring" ]
-tokio-console = [ "dep:console-subscriber", "tokio/tracing" ]
+telemetry = [
+	"dep:axum",
+	"dep:opentelemetry",
+	"dep:opentelemetry-otlp",
+	"dep:opentelemetry_sdk",
+	"dep:tracing-opentelemetry",
+]
+tokio-console = [ "dep:console-subscriber", "telemetry", "tokio/tracing" ]
 
 [lib]
 bench = false
